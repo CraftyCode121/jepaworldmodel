@@ -1,0 +1,12 @@
+[project]
+name = "jepa-wm"
+version = "0.1.0"
+description = "Physics-based synthetic dataset generation for training a JEPA world model."
+readme = "README.md"
+requires-python = ">=3.14"
+
+dependencies = [
+    "jax",
+    "jaxlib",
+    "numpy",
+]
