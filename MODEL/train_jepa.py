@@ -1,12 +1,3 @@
-"""
-Stage 1: JEPA pretraining (self-supervised, no labels).
-Predict latent of a future frame from a window of past frames.
-Online encoder trained by gradient descent; target encoder is an EMA copy
-(stop-gradient), preventing representation collapse.
-
-Requires: pip install flax optax
-Run: python train_jepa.py
-"""
 import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
@@ -19,6 +10,7 @@ from jax import random
 import flax.linen as nn
 import optax
 from flax.training import train_state
+import json
 
 # CONFIG
 
@@ -28,9 +20,9 @@ CONFIG = dict(
     latent_dim     = 256,
     min_context    = 6,
     max_context    = 12,
-    max_horizon    = 15,     
+    max_horizon    = 15,    
     batch_size     = 8,
-    steps          = 5000,
+    steps          = 50_000,
     lr             = 3e-4,
     ema_momentum   = 0.996,
     log_every      = 50,
@@ -38,19 +30,20 @@ CONFIG = dict(
     ckpt_dir       = "checkpoints",
     seed           = 0,
 )
+
 os.makedirs(CONFIG["ckpt_dir"], exist_ok=True)
 print("JAX devices:", jax.devices())
 
 CONFIG["variance_weight"] = 25.0
 CONFIG["variance_target"] = 1.0 / (CONFIG["latent_dim"] ** 0.5)  # ~0.0625 for latent_dim=256;
 # normalized vectors live on the unit hypersphere, so natural per-dim std is ~1/sqrt(dim),
+# not 1.0 (that was calibrated for raw, unnormalized embeddings).
 
 def variance_loss(embeddings, target_std=CONFIG["variance_target"]):
     """VICReg variance term: penalizes any embedding dimension whose std across
     the batch falls below target_std. Directly opposes collapse to a constant vector."""
     std = jnp.sqrt(jnp.var(embeddings, axis=0) + 1e-4)
     return jnp.mean(jax.nn.relu(target_std - std))
-
 
 # DATA: load manifest, sample (context_frames, target_frame) windows
 
@@ -67,7 +60,7 @@ print(f"Dataset: {len(MANIFEST)} videos")
 from collections import OrderedDict
 
 _cache = OrderedDict()
-_CACHE_MAX_VIDEOS = 500  # ~500 * 2.5MB ~= 1.25GB
+_CACHE_MAX_VIDEOS = 500  
 
 def load_video_frames(path):
     if path in _cache:
@@ -105,18 +98,17 @@ def sample_batch(rng, batch_size):
     return ctx.astype(np.float32) / 255.0, ctx_lens, tgt.astype(np.float32) / 255.0
 
 
-# small CNN encoder + transformer predictor
+# MODEL: small CNN encoder and transformer predictor
 
 class Encoder(nn.Module):
     latent_dim: int
 
     @nn.compact
-    def __call__(self, x):  # x: [B, RES, RES, 3]
+    def __call__(self, x):  
         for feat in (32, 64, 128, 256, 256):
             x = nn.Conv(feat, (4, 4), strides=(2, 2), padding="SAME")(x)
             x = nn.LayerNorm()(x)
             x = nn.gelu(x)
-        
         x = x.reshape(x.shape[0], -1)
         x = nn.Dense(self.latent_dim)(x)
         return x
@@ -133,7 +125,7 @@ class Predictor(nn.Module):
         B, T, D = ctx_latents.shape
         pos = self.param("pos_embed", nn.initializers.normal(0.02), (1, T, D))
         x = ctx_latents + pos
-        attn_mask = ctx_mask[:, None, None, :].astype(bool)  
+        attn_mask = ctx_mask[:, None, None, :].astype(bool)  # [B,1,1,T]
         for _ in range(self.n_layers):
             y = nn.LayerNorm()(x)
             y = nn.MultiHeadDotProductAttention(num_heads=self.n_heads)(y, y, mask=attn_mask)
@@ -143,7 +135,7 @@ class Predictor(nn.Module):
             y = nn.gelu(y)
             y = nn.Dense(D)(y)
             x = x + y
-        # pool valid context tokens, condition on target horizon, predict target latent
+       
         mask_f = ctx_mask[..., None].astype(jnp.float32)
         pooled = jnp.sum(x * mask_f, axis=1) / jnp.clip(jnp.sum(mask_f, axis=1), 1.0)
         h = jnp.concatenate([pooled, horizon_embed], axis=-1)
@@ -160,7 +152,7 @@ def horizon_embedding(horizon, dim):
     return jnp.concatenate([jnp.sin(h * freqs), jnp.cos(h * freqs)], axis=-1)
 
 
-# TRAIN STATE (online encoder + predictor; target encoder = EMA params)
+# TRAIN STATE 
 
 class JEPAState(train_state.TrainState):
     target_params: dict = None
@@ -203,9 +195,20 @@ def make_train_step(enc, pred):
         target_latent = enc.apply({"params": target_params["encoder"]}, tgt_img.astype(jnp.bfloat16))
         target_latent = jax.lax.stop_gradient(target_latent).astype(jnp.float32)
 
+        # ALSO encode the same target images with the ONLINE encoder (gradient flows).
+        # This is what actually needs regularizing: ctx_latents having variance doesn't
+        # stop the predictor from collapsing pred_latent to match a collapsed target_latent.
+        
         online_target_latent = enc.apply({"params": params["encoder"]}, tgt_img.astype(jnp.bfloat16))
         online_target_latent = online_target_latent.astype(jnp.float32)
 
+        # plain MSE in raw latent space (no normalization). Keeping prediction loss and
+        # variance regularization in the SAME (raw) space is the standard VICReg setup 
+        # it avoids two failure modes we hit with cosine-normalized loss: (1) the encoder
+        # inflating raw magnitude to cheaply satisfy variance while cosine loss can't see
+        # it, and (2) raw magnitude collapsing toward zero, which makes normalization
+        # (dividing by norm+eps) numerically unstable and degenerate.
+        
         pred_loss = jnp.mean((pred_latent - target_latent) ** 2)
 
         # anti-collapse: regularize the online encoder's output on target-type images
@@ -246,6 +249,7 @@ if __name__ == "__main__":
     T = CONFIG["max_context"]
     t0 = time.time()
     for step in range(1, CONFIG["steps"] + 1):
+       
         ctx_np, ctx_lens, tgt_np = sample_batch(rng_np, CONFIG["batch_size"])
         ctx_mask_np = (np.arange(T)[None, :] < ctx_lens[:, None]).astype(np.float32)
         horizon_np = ctx_lens.astype(np.float32)  # placeholder scalar conditioning signal
@@ -265,7 +269,23 @@ if __name__ == "__main__":
                   f"target_std={float(target_std):.5f} online_std={float(online_std):.5f} "
                   f"({elapsed/step:.3f}s/step)")
 
+            log_entry = {
+                "step": step,
+                "progress": step / CONFIG['steps'],
+                "loss": float(loss),
+                "pred_loss": float(pred_loss),
+                "var_loss": float(var_loss),
+                "target_std": float(target_std),
+                "online_std": float(online_std),
+                "elapsed_per_step": elapsed / step
+            }
+        
+            with open("training_logs.jsonl", "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+            
+
         if step % CONFIG["ckpt_every"] == 0:
+            
             path = os.path.join(CONFIG["ckpt_dir"], f"step_{step}.npz")
             flat_params = jax.tree_util.tree_map(np.asarray, state.params)
             np.savez(path, **{"encoder": flat_params["encoder"],
@@ -273,3 +293,13 @@ if __name__ == "__main__":
             print(f"Saved checkpoint: {path}")
 
     print("Training done.")
+    
+"""
+Stage 1: JEPA pretraining (self-supervised, no labels).
+Predict latent of a future frame from a window of past frames.
+Online encoder trained by gradient descent; target encoder is an EMA copy
+(stop-gradient), preventing representation collapse.
+
+Requires: pip install flax optax
+Run: python train_jepa.py
+"""
